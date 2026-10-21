@@ -1,0 +1,341 @@
+package ir.tamin.incomeBank.service.financialDoc;
+
+import ir.tamin.framework.cdi.util.MessageBundle;
+import ir.tamin.framework.cdi.util.WebProperties;
+import ir.tamin.framework.core.util.Bundle;
+import ir.tamin.framework.ws.rest.json.Filter;
+import ir.tamin.framework.ws.rest.json.FilterWrapper;
+import ir.tamin.framework.ws.rest.json.SortWrapper;
+import ir.tamin.framework.ws.rest.security.TokenContext;
+import ir.tamin.incomeBank.dao.financialDoc.FinancialDocDAOService;
+import ir.tamin.incomeBank.model.financialDoc.ElmDetail;
+import ir.tamin.incomeBank.model.financialDoc.ElmHeader;
+import ir.tamin.incomeBank.model.financialDoc.FinancialDoc;
+import ir.tamin.incomeBank.model.financialDoc.FinancialDocSummery;
+import ir.tamin.incomeBank.model.financialDoc.newFinancialDoc3070.FinancialDocStatus;
+import ir.tamin.incomeBank.service.financialDoc.newFinancialDoc3070.FinancialDocSorat3070Service;
+import ir.tamin.incomeBank.service.identityManager.UserBean;
+import ir.tamin.incomeBank.service.jdbc.StoredProcedure;
+import ir.tamin.incomeBank.util.DateUtils;
+import ir.tamin.incomeBank.util.ExcelDataProvider;
+import ir.tamin.incomeBank.util.ExcelReportHeader;
+import ir.tamin.incomeBank.ws.soap.*;
+import ir.tamin.portal.model.org.User;
+import org.apache.poi.ss.usermodel.Workbook;
+
+import javax.ejb.Stateless;
+import javax.inject.Inject;
+import javax.persistence.EntityManager;
+import javax.ws.rs.WebApplicationException;
+import javax.ws.rs.core.StreamingOutput;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.sql.Types;
+import java.util.*;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+
+/**
+ * @author A_Jamali
+ */
+@Stateless
+public class FinancialDocService {
+
+    @Inject
+    private FinancialDocDAOService financialDAOService;
+
+    @Inject
+    private ExcelDataProvider excelDataConverter;
+
+    @Inject
+    @MessageBundle
+    Bundle messageBundle;
+    @Inject
+    private StoredProcedure procedure;
+    @Inject
+    private TokenContext tokenContext;
+    @Inject
+    @WebProperties
+    Bundle webBundle;
+    @Inject
+    private UserBean userBean;
+
+    @Inject
+    private EntityManager entityManager;
+
+    public Map<String, Object> getAll(FilterWrapper filterWrapper, Integer start, Integer limit, SortWrapper sort) throws Exception {
+        Map<String, Object> map = new HashMap<>();
+        try {
+            map.put("list", financialDAOService.search(filterWrapper, start, limit, sort));
+            map.put("total", financialDAOService.getCount(filterWrapper));
+        } catch (Exception ex) {
+            Logger.getLogger(FinancialDocService.class.getName()).log(Level.SEVERE, null, ex);
+            throw ex;
+        }
+
+        return map;
+    }
+
+    public FinancialDocSummery getSummery(FilterWrapper filterWrapper) {
+
+        try {
+            return financialDAOService.getSummaryPrice(filterWrapper);
+        } catch (Exception ex) {
+            Logger.getLogger(FinancialDocService.class.getName()).log(Level.SEVERE, null, ex);
+            throw ex;
+        }
+    }
+
+    public String sendDataToTemp(FilterWrapper filterWrapper) throws Exception {
+        ServiceResult serviceResult;
+        String result = null;
+        ElmService elmService = new ElmService();
+        ElmHeader elmHeader = new ElmHeader();
+        List<ElmDetail> elmDetailList = new ArrayList<>();
+        List<String> messageList = new ArrayList<>();
+        Optional<Filter> yearFilter = null;
+        Optional<Filter> monthFilter = null;
+
+        if (filterWrapper == null) {
+            throw new WebApplicationException(messageBundle.getProperty("financialDoc.filterIsEmpty"));
+        }
+        yearFilter = filterWrapper.getFilters().stream()
+                .filter(item -> item.getProperty().equals("daramadYear"))
+                .findFirst();
+        monthFilter = filterWrapper.getFilters().stream()
+                .filter(item -> item.getProperty().equals("daramadMonth"))
+                .findFirst();
+        if (!(yearFilter.isPresent() && monthFilter.isPresent())) {
+            throw new WebApplicationException(messageBundle.getProperty("financialDoc.filterIsEmpty"));
+        }
+        List<FinancialDoc> financialDocList = financialDAOService.search(filterWrapper, null, null, null);
+
+        if (financialDocList.size() == 0) {
+            throw new WebApplicationException(messageBundle.getProperty("financialDoc.docNotSent"));
+        }
+        elmHeader.setVahedCode(webBundle.getProperty("financialDoc.sendDataToTemp.vahedCode"));
+        elmHeader.setFaDate(DateUtils.format(new Date(), "yyyyMMdd"));
+        elmHeader.setDetailDesc(messageBundle.getProperty("financialDoc.headerDetailDesc")
+                .replace("{month}", monthFilter.get().getValue())
+                .replace("{year}", yearFilter.get().getValue()));
+        elmHeader.setSysType("2");
+        elmHeader.setYear(yearFilter.get().getValue());
+
+        financialDocList.forEach(item -> {
+            elmDetailList.add(new ElmDetail(webBundle.getProperty("financialDoc.sendDataToTemp.vahedCode"),
+                    item.getAccountCode().substring(0, 2),
+                    item.getAccountCode().substring(2, 4),
+                    item.getAccountCode().substring(4, 10),
+                    "", "",
+                    item.getAccountDesc(),
+                    item.getDebtAmount(),
+                    item.getCreditAmount(),
+                    "2", item.getValueShenaseh(), "",
+                    item.getDaramadYear()));
+
+        });
+
+        AccVoucherEntity accVoucherEntity = new AccVoucherEntity();
+        accVoucherEntity.setHeader(new HeadEntity(elmHeader));
+        accVoucherEntity.setDetails(new ArrayOfDetailEntity(elmDetailList));
+
+        serviceResult = elmService.getServiceSoap().sendDataToTemp(accVoucherEntity, false);
+        if (serviceResult.getGetServiceErrorList().getString().size() != 0) {
+            throw new WebApplicationException(messageBundle.getProperty("financialDoc.sendTempNoResponse"));
+        }
+
+
+        messageList = serviceResult.getGetServiceMessageList().getString();
+        result = messageList.get(messageList.size() - 1).replaceAll("[^0-9]", "");
+
+        return submitTempSequence(monthFilter.get().getValue(), yearFilter.get().getValue(), result);
+    }
+
+    private String submitTempSequence(String year, String month, String sequence) {
+
+        String result = null;
+        try {
+            result = financialDAOService.storeTempSequence(year, month,
+                    webBundle.getProperty("financialDoc.submitTempSequence.vahedCode"), sequence);
+        } catch (Exception ex) {
+            Logger.getLogger(FinancialDocService.class.getName()).log(Level.SEVERE, null, ex);
+            throw new WebApplicationException(ex.getMessage());
+        }
+        return result;
+    }
+
+    public Object importFinancialDocs(String year, String month) {
+
+
+        try {
+            return financialDAOService.financialIssuance(year, month);
+        } catch (Exception ex) {
+            Logger.getLogger(FinancialDocService.class.getName()).log(Level.SEVERE, null, ex);
+            throw new WebApplicationException(ex.getMessage());
+        }
+
+    }
+
+    public Object removeFinancialDocs(String year, String month) {
+
+        try {
+            return financialDAOService.financialRemove(year, month);
+        } catch (Exception ex) {
+            Logger.getLogger(FinancialDocService.class.getName()).log(Level.SEVERE, null, ex);
+            throw new WebApplicationException(ex.getMessage());
+        }
+    }
+
+    public StreamingOutput loadExcel(FilterWrapper filterWrapper) throws Exception {
+        List<FinancialDoc> financialDocList = null;
+        FinancialDocSummery financialDocSummery = null;
+
+        try {
+            financialDocList = (List<FinancialDoc>) this.getAll(filterWrapper, 0, Integer.MAX_VALUE, null).get("list");
+        } catch (Exception ex) {
+            throw ex;
+        }
+
+        financialDocSummery = financialDAOService.getSummaryPrice(filterWrapper);
+        FinancialDoc summery = new FinancialDoc();
+        summery.setDebtAmount(financialDocSummery.getDebtAmount());
+        summery.setCreditAmount(financialDocSummery.getCreditAmount());
+
+        financialDocList.add(summery);
+
+        List<List<String>> rowsForExcel = prepareDataForExcel(financialDocList);
+        ExcelReportHeader reportHeader = createReportHeaderDetails();
+
+        StreamingOutput streamingOutPut = new StreamingOutput() {
+            final Workbook workbook = excelDataConverter.provideExcelFrom(reportHeader, rowsForExcel);
+
+            @Override
+            public void write(OutputStream output) throws IOException, WebApplicationException {
+                workbook.write(output);
+            }
+        };
+
+        return streamingOutPut;
+    }
+
+    private List<List<String>> prepareDataForExcel(List<FinancialDoc> financialDocList) {
+        List<List<String>> rows = new ArrayList<>();
+        rows.add(Arrays.asList(
+                "ردیف",
+                "کد مالی",
+                "شرح ردیف",
+                "مبلغ بدهکار",
+                "مبلغ بستانکار"
+        ));
+        int rowCounter = 1;
+        for (FinancialDoc financialDoc : financialDocList) {
+            List<String> row = new ArrayList<>();
+            row.add(rowCounter == financialDocList.size() ? "مجموع" : String.valueOf(rowCounter));
+            row.add(financialDoc.getAccountCode() != null ? financialDoc.getAccountCode() : "-");
+            row.add(financialDoc.getAccountDesc() != null ? financialDoc.getAccountDesc() : "-");
+            row.add(financialDoc.getDebtAmount() != null ? financialDoc.getDebtAmount().toString() : "-");
+            row.add(financialDoc.getCreditAmount() != null ? financialDoc.getCreditAmount().toString() : "-");
+            rows.add(row);
+            rowCounter++;
+        }
+        return rows;
+    }
+
+    private ExcelReportHeader createReportHeaderDetails() {
+        ExcelReportHeader reportHeader = new ExcelReportHeader();
+        reportHeader.setTitle("گزارش سند مالی");
+        reportHeader.setReportDate(DateUtils.format(new Date(), "yyyy/MM/dd - hh:mm"));
+        return reportHeader;
+    }
+
+    //لیست هوشمند : تهیه مغایرت
+    public Map<String, Object> discrepancyPreparation(FilterWrapper filterWrapper) throws Exception {
+        String year = null;
+        String month = null;
+        String brchcode = null;
+
+        for (Filter filter : filterWrapper.getFilters()) {
+
+            String field = filter.getProperty();
+            if (field.contains("moghYear")) {
+                year = filter.getValue();
+            }
+            if (field.contains("moghMonth")) {
+                month = filter.getValue();
+            }
+            if (field.contains("moghSystem")) {
+                brchcode = filter.getValue();
+            }
+        }
+        procedure.init();
+        procedure.query("{?=call Pck_Telproc_Core.GetMoghListInfo(?,?,?,?,?,?,?,?,?,?,?,?,?)}");
+        procedure.setOutParameter(1, Types.NVARCHAR)
+                .setInParameter(2, brchcode)
+                .setInParameter(3, year)
+                .setInParameter(4, month)
+                .setOutParameter(5, Types.BIGINT)
+                .setOutParameter(6, Types.BIGINT)
+                .setOutParameter(7, Types.BIGINT)
+                .setOutParameter(8, Types.BIGINT)
+                .setOutParameter(9, Types.BIGINT)
+                .setOutParameter(10, Types.BIGINT)
+                .setOutParameter(11, Types.BIGINT)
+                .setOutParameter(12, Types.BIGINT)
+                .setOutParameter(13, Types.BIGINT)
+                .setOutParameter(14, Types.BIGINT);
+
+        procedure.execute();
+        Map<String, Object> result = new HashMap<>();
+        result.put("param1", procedure.getOutParameter(1).toString());
+
+        //unused**************************************************************
+       /* result.put("nashenas_cnt", procedure.getOutParameter(5).toString());
+        result.put("nashenas_amt", procedure.getOutParameter(6).toString());
+        result.put("tekrari_cnt", procedure.getOutParameter(7).toString());
+        result.put("tekrari_amt", procedure.getOutParameter(8).toString());
+        result.put("jaryan_cnt", procedure.getOutParameter(9).toString());
+        result.put("jaryan_amt", procedure.getOutParameter(10).toString());
+        result.put("g72_cnt", procedure.getOutParameter(11).toString());
+        result.put("g72_amt", procedure.getOutParameter(12).toString());*/
+
+        return result;
+    }
+
+    //تایید مغایرت : لیست هوشمند
+    public Map<String, Object> confrimDisagreements(FilterWrapper filterWrapper) throws Exception {
+        String year = null;
+        String month = null;
+        String brchcode = null;
+        User user = this.userBean.getUserByUserName(this.tokenContext.getCurrentUser().getName());
+        String userId = String.valueOf(user.getNationalCode());
+
+        for (Filter filter : filterWrapper.getFilters()) {
+
+            String field = filter.getProperty();
+            if (field.contains("moghYear")) {
+                year = filter.getValue();
+            }
+            if (field.contains("moghMonth")) {
+                month = filter.getValue();
+            }
+            if (field.contains("moghSystem")) {
+                brchcode = filter.getValue();
+            }
+        }
+        procedure.init();
+        procedure.query("{?=call Pck_Telproc_Core.ConfMogh3070(?,?,?,?)}");//TODO-----یکیه تست گرفتم جواب میده
+        procedure.setOutParameter(1, Types.NVARCHAR)
+                .setInParameter(2, brchcode)
+                .setInParameter(3, year)
+                .setInParameter(4, month)
+                .setInParameter(5, userId);
+
+        procedure.execute();
+        Map<String, Object> result = new HashMap<>();
+        result.put("param1", procedure.getOutParameter(1).toString());
+
+
+        return result;
+    }
+}
